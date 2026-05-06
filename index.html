@@ -112,6 +112,15 @@
     color: #8e8e93;
     text-align: center;
   }
+  footer a {
+    color: inherit;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  footer a:hover { color: #1d1d1f; }
+  @media (prefers-color-scheme: dark) {
+    footer a:hover { color: #f5f5f7; }
+  }
   @media (prefers-color-scheme: dark) {
     body { background: #000; color: #f5f5f7; }
     #dropzone { background: #1c1c1e; border-color: #3a3a3c; }
@@ -146,7 +155,10 @@
     </details>
   </div>
 
-  <footer>Runs entirely in your browser. Nothing leaves the page.</footer>
+  <footer>
+    Runs entirely in your browser. Nothing leaves the page.
+    · <a href="https://github.com/jkbpvsc/sepa-si" target="_blank" rel="noopener">Source on GitHub</a>
+  </footer>
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
