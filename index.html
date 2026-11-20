@@ -684,10 +684,15 @@ function buildEPC(upn) {
   if (!upn.recipientIban) throw new Error('UPN QR missing recipient IBAN.');
   if (!upn.recipientName) throw new Error('UPN QR missing recipient name.');
 
-  const remittanceParts = [];
-  if (upn.recipientRef) remittanceParts.push(upn.recipientRef);
-  if (upn.purpose) remittanceParts.push(upn.purpose);
-  const remittance = remittanceParts.join(' ').substring(0, 140);
+  // The reference travels alone in its field, because it is the one thing the
+  // creditor reconciles on. The purpose text is only sent when the bill has no
+  // reference ("NRC" / model SI99 mean exactly that).
+  const ref = upn.recipientRef.replace(/\s+/g, '').toUpperCase();
+  const hasRef = ref !== '' && ref !== 'NRC' && ref !== 'SI99';
+  // Only ISO 11649 "RF" references are valid in the structured field;
+  // Slovenian SI-model references go in the unstructured one.
+  const structured = /^RF\d{2}[A-Z0-9]{1,21}$/.test(ref) ? ref : '';
+  const unstructured = structured ? '' : hasRef ? upn.recipientRef : upn.purpose;
 
   const fields = [
     'BCD',                                       // Service tag
@@ -699,10 +704,13 @@ function buildEPC(upn) {
     upn.recipientIban,                           // Beneficiary IBAN
     `EUR${upn.amount}`,                          // Amount
     upn.purposeCode.substring(0, 4),             // Purpose (optional)
-    '',                                          // Structured remittance (RF only)
-    remittance,                                  // Unstructured remittance
+    structured,                                  // Structured remittance (RF only)
+    unstructured.substring(0, 140),              // Unstructured remittance
     '',                                          // Beneficiary-to-originator info
   ];
+  // Trailing empty elements are left out rather than sent as blank lines;
+  // strict readers trip over a payload that ends in a separator.
+  while (fields.length > 8 && fields[fields.length - 1] === '') fields.pop();
   return fields.join('\n');
 }
 
