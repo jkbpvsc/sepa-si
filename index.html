@@ -45,6 +45,63 @@
   }
   #dropzone:active { transform: scale(.995); }
   #dropzone p { margin: 0; color: #6e6e73; }
+  #dropzone .busy-text, #dropzone.busy .idle-text { display: none; }
+  #dropzone.busy .busy-text { display: block; }
+  #cameraBtn {
+    display: block;
+    width: 100%;
+    margin-top: 12px;
+    padding: 13px 20px;
+    border: 0;
+    border-radius: 12px;
+    background: #fff;
+    color: #007aff;
+    font: inherit;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .15s, transform .1s;
+  }
+  #cameraBtn:hover { background: #f0f7ff; }
+  #cameraBtn:active { transform: scale(.995); }
+  #scanner {
+    position: relative;
+    margin-top: 12px;
+    border-radius: 16px;
+    overflow: hidden;
+    background: #000;
+  }
+  #scanner video {
+    display: block;
+    width: 100%;
+    max-height: 70vh;
+    object-fit: cover;
+  }
+  #scanHint {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    margin: 0;
+    padding: 32px 16px 14px;
+    color: #fff;
+    font-size: 14px;
+    text-align: center;
+    background: linear-gradient(transparent, rgba(0,0,0,.65));
+    pointer-events: none;
+  }
+  #scanClose {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    padding: 6px 14px;
+    border: 0;
+    border-radius: 999px;
+    background: rgba(0,0,0,.55);
+    color: #fff;
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+  }
   kbd {
     background: #fff;
     padding: 1px 6px;
@@ -126,6 +183,8 @@
     #dropzone { background: #1c1c1e; border-color: #3a3a3c; }
     #dropzone:hover, #dropzone.drag { background: #1a2030; border-color: #0a84ff; }
     #dropzone p, dt, summary, p.lede, footer { color: #98989d; }
+    #cameraBtn { background: #1c1c1e; color: #0a84ff; }
+    #cameraBtn:hover { background: #1a2030; }
     kbd { background: #2c2c2e; border-color: #3a3a3c; color: #f5f5f7; }
     #result { background: #1c1c1e; box-shadow: none; }
     pre { background: #2c2c2e; }
@@ -140,8 +199,17 @@
   <p class="lede">Paste a Slovenian UPN QR code. Get a SEPA QR you can scan in Revolut.</p>
 
   <div id="dropzone" tabindex="0">
-    <p>Click to upload, paste an image with <kbd>⌘V</kbd>, or drop one here</p>
+    <p class="idle-text">Click to upload, paste an image with <kbd>⌘V</kbd>, or drop one here</p>
+    <p class="busy-text">Reading QR code…</p>
     <input type="file" id="fileInput" accept="image/*" hidden>
+  </div>
+
+  <button id="cameraBtn" class="hidden" type="button">Scan with camera</button>
+
+  <div id="scanner" class="hidden">
+    <video id="video" playsinline muted></video>
+    <p id="scanHint"></p>
+    <button id="scanClose" type="button">Close</button>
   </div>
 
   <div id="error" class="hidden"></div>
@@ -161,7 +229,7 @@
   </footer>
 </main>
 
-<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.7/dist/iife/reader/index.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <script>
 const dropzone = document.getElementById('dropzone');
@@ -208,76 +276,340 @@ window.addEventListener('paste', (e) => {
   if (text.trim().startsWith('UPNQR')) processUPN(text);
 });
 
-function handleFile(file) {
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    const img = new Image();
-    img.onload = () => decodeQR(img);
-    img.onerror = () => showError('Could not load that file as an image.');
-    img.src = e.target.result;
-  };
-  reader.onerror = () => showError('Could not read that file.');
-  reader.readAsDataURL(file);
+// ---------------------------------------------------------------------------
+// QR reading — ZXing-C++ compiled to WebAssembly.
+//
+// A UPN QR is a dense version-15 symbol, so in a phone photo of a bill each
+// module is only a few pixels wide. One look at a downscaled copy is not
+// enough: we read the photo at full resolution and, if that fails, retry
+// sharpened, enlarged, and (for very large photos) tile by tile.
+// ---------------------------------------------------------------------------
+const READER_OPTIONS = {
+  formats: ['QRCode'],
+  tryHarder: true,
+  tryRotate: true,
+  tryInvert: true,
+  tryDownscale: true,
+  tryDenoise: true,
+  maxNumberOfSymbols: 4,   // a bill can carry other QR codes next to the UPN one
+  textMode: 'Plain',       // the default escapes control characters as "<LF>" in some payloads
+};
+
+// iOS Safari refuses canvases above ~16.7 megapixels.
+const MAX_PIXELS = 16e6;
+
+const hasReader = typeof ZXingWASM !== 'undefined';
+// Fetch and compile the .wasm up front so the first read is instant.
+if (hasReader) warmUpReader();
+
+function warmUpReader() {
+  ZXingWASM.prepareZXingModule({ fireImmediately: true })
+    .catch((err) => console.warn('[UPN→SEPA] QR reader failed to preload:', err));
 }
 
-function decodeQR(img) {
-  const canvas = document.createElement('canvas');
-  // Cap size to keep jsQR fast on huge screenshots
-  const max = 2000;
-  const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
-  canvas.width = Math.round(img.naturalWidth * scale);
-  canvas.height = Math.round(img.naturalHeight * scale);
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-  const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const code = jsQR(data.data, data.width, data.height, { inversionAttempts: 'attemptBoth' });
-  console.group('[UPN→SEPA] QR decode');
-  console.log('Image size (raw):', img.naturalWidth, '×', img.naturalHeight);
-  console.log('Image size (decoded):', canvas.width, '×', canvas.height);
-  if (!code) {
-    console.warn('jsQR returned null — no QR detected.');
-    console.groupEnd();
-    showError('No QR code detected. Try a sharper or larger image.');
-    return;
+const work = document.createElement('canvas');
+const workCtx = work.getContext('2d', { willReadFrequently: true });
+
+// Draw a region of an image or video frame at w×h and return its pixels.
+function grab(source, sx, sy, sw, sh, w, h) {
+  work.width = w;
+  work.height = h;
+  workCtx.imageSmoothingQuality = 'high';
+  workCtx.fillStyle = '#fff';            // transparent PNGs would read as black
+  workCtx.fillRect(0, 0, w, h);
+  workCtx.drawImage(source, sx, sy, sw, sh, 0, 0, w, h);
+  return workCtx.getImageData(0, 0, w, h);
+}
+
+// Box blur of an 8-bit plane, written back into `plane` (`tmp` is scratch).
+function boxBlur(plane, tmp, w, h, r) {
+  const win = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let sum = plane[row] * (r + 1);
+    for (let x = 1; x <= r; x++) sum += plane[row + Math.min(x, w - 1)];
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = sum / win;
+      sum += plane[row + Math.min(x + r + 1, w - 1)] - plane[row + Math.max(x - r, 0)];
+    }
+  }
+  const col = new Float64Array(w);
+  for (let x = 0; x < w; x++) col[x] = tmp[x] * (r + 1);
+  for (let y = 1; y <= r; y++) {
+    const row = Math.min(y, h - 1) * w;
+    for (let x = 0; x < w; x++) col[x] += tmp[row + x];
+  }
+  for (let y = 0; y < h; y++) {
+    const row = y * w, add = Math.min(y + r + 1, h - 1) * w, sub = Math.max(y - r, 0) * w;
+    for (let x = 0; x < w; x++) {
+      plane[row + x] = col[x] / win;
+      col[x] += tmp[add + x] - tmp[sub + x];
+    }
+  }
+}
+
+// Unsharp mask, in place. Pulls a soft-focus QR back over the reader's threshold.
+function sharpen(pixels) {
+  const { data, width: w, height: h } = pixels;
+  const n = w * h;
+  const lum = new Uint8Array(n), blur = new Uint8Array(n), tmp = new Uint8Array(n);
+  for (let i = 0, p = 0; i < n; i++, p += 4) {
+    lum[i] = (data[p] * 77 + data[p + 1] * 150 + data[p + 2] * 29) >> 8;
+  }
+  blur.set(lum);
+  // Two box blurs ≈ a Gaussian; radius follows resolution (σ ≈ 3px at 12 MP).
+  const r = Math.max(2, Math.min(4, Math.round(Math.max(w, h) / 1200)));
+  boxBlur(blur, tmp, w, h, r);
+  boxBlur(blur, tmp, w, h, r);
+  const AMOUNT = 5;
+  for (let i = 0, p = 0; i < n; i++, p += 4) {
+    const v = lum[i] + AMOUNT * (lum[i] - blur[i]);
+    data[p] = data[p + 1] = data[p + 2] = v < 0 ? 0 : v > 255 ? 255 : v;
+  }
+  return pixels;
+}
+
+// The views of a still image worth trying, cheapest and most likely first.
+function* imagePasses(img) {
+  const W = img.naturalWidth, H = img.naturalHeight;
+  const fit = Math.min(1, Math.sqrt(MAX_PIXELS / (W * H)));
+  const bw = Math.round(W * fit), bh = Math.round(H * fit);
+
+  const whole = grab(img, 0, 0, W, H, bw, bh);
+  yield [`whole image ${bw}×${bh}`, whole];
+  yield ['whole image, sharpened', sharpen(whole)];
+
+  // Low-resolution pictures (messenger-compressed photos, webcam stills, codes
+  // shot from far away): modules a pixel or two wide resolve once enlarged.
+  const room = Math.sqrt(MAX_PIXELS / (bw * bh));
+  for (const want of Math.max(bw, bh) <= 1200 ? [2, 3] : [2]) {
+    const zoom = Math.min(want, room);
+    if (zoom < want && zoom < 1.25) break;
+    const big = grab(img, 0, 0, W, H, Math.round(bw * zoom), Math.round(bh * zoom));
+    yield [`enlarged ×${zoom.toFixed(1)}`, big];
+    yield [`enlarged ×${zoom.toFixed(1)}, sharpened`, sharpen(big)];
+    if (zoom < want) break;
   }
 
-  // UPN QR uses ISO-8859-2 (Latin-2) with ECI mode — jsQR returns empty .data
-  // for that, but the raw bytes are intact in .binaryData. Prefer that route.
-  let text = code.data;
-  if (code.binaryData && code.binaryData.length) {
-    const bytes = new Uint8Array(code.binaryData);
-    const looksLikeUPN = bytes.length >= 5 &&
-      bytes[0] === 0x55 && bytes[1] === 0x50 && bytes[2] === 0x4E &&
-      bytes[3] === 0x51 && bytes[4] === 0x52;
-    if (looksLikeUPN || !text) {
-      text = new TextDecoder('iso-8859-2').decode(bytes);
-      console.log('Re-decoded binaryData as ISO-8859-2.');
+  // Photos too big for one canvas were shrunk above — go back over them at
+  // native resolution in overlapping tiles.
+  if (fit < 1) {
+    const tw = Math.ceil(W / 2), th = Math.ceil(H / 2);
+    const k = Math.min(1, Math.sqrt(MAX_PIXELS / (tw * th)));
+    for (const fy of [0, 0.5, 1]) {
+      for (const fx of [0, 0.5, 1]) {
+        const sx = Math.round((W - tw) * fx), sy = Math.round((H - th) * fy);
+        yield [`tile at ${sx},${sy}`, grab(img, sx, sy, tw, th, Math.round(tw * k), Math.round(th * k))];
+      }
     }
   }
-  console.log('jsQR raw data string:', JSON.stringify(code.data));
-  console.log('jsQR raw data (visible):', code.data);
-  console.log('Length:', code.data.length);
-  console.log('First 8 char codes:', [...code.data.slice(0, 8)].map(c => c.charCodeAt(0).toString(16).padStart(4, '0')).join(' '));
-  console.log('binaryData (bytes):', code.binaryData);
-  if (code.binaryData) {
-    const bytes = new Uint8Array(code.binaryData);
-    console.log('First 32 bytes (hex):', [...bytes.slice(0, 32)].map(b => b.toString(16).padStart(2, '0')).join(' '));
-    try {
-      const utf8 = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-      const latin2 = new TextDecoder('iso-8859-2', { fatal: false }).decode(bytes);
-      const win1250 = new TextDecoder('windows-1250', { fatal: false }).decode(bytes);
-      console.log('Decoded as UTF-8:', utf8);
-      console.log('Decoded as ISO-8859-2:', latin2);
-      console.log('Decoded as Windows-1250:', win1250);
-    } catch (e) {
-      console.warn('Re-decode failed:', e);
-    }
+}
+
+// UPN QR is specified as ISO-8859-2 announced by an ECI header. With the
+// header ZXing has already decoded the text; generators that leave it out
+// leave us to work the charset out from the bytes.
+function decodePayload(result) {
+  if (result.hasECI && result.text) return result.text;
+  const bytes = result.bytes;
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {}
+  // 0x80–0x9F are control codes in ISO-8859-2 but letters (Š, Ž, š, ž) in Windows-1250.
+  const cp1250 = bytes.some(b => b >= 0x80 && b <= 0x9f);
+  return new TextDecoder(cp1250 ? 'windows-1250' : 'iso-8859-2').decode(bytes);
+}
+
+async function readQR(pixels) {
+  let results;
+  try {
+    results = await ZXingWASM.readBarcodes(pixels, READER_OPTIONS);
+  } catch (err) {
+    console.error('[UPN→SEPA] QR reader error:', err);
+    if (hasReader) ZXingWASM.purgeZXingModule();   // let the next attempt fetch it again
+    throw new Error('Could not load the QR reader. Check your connection and try again.');
   }
-  console.log('chunks:', code.chunks);
-  console.log('version:', code.version);
-  console.log('Final text used for parsing:', JSON.stringify(text));
-  console.groupEnd();
-  processUPN(text);
+  return results.filter(r => r.isValid).map(decodePayload);
+}
+
+const isUPN = (text) => /^[\s﻿]*UPNQR/i.test(text);
+const pause = (ms = 0) => new Promise(resolve => setTimeout(resolve, ms));
+
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => resolve({ img, release: () => URL.revokeObjectURL(url) });
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      const heic = /hei[cf]/i.test(file.type) || /\.hei[cf]$/i.test(file.name || '');
+      reject(new Error(heic
+        ? 'This browser cannot open HEIC photos. Export it as JPEG, or take a screenshot of the photo and paste that.'
+        : 'Could not load that file as an image.'));
+    };
+    img.src = url;
+  });
+}
+
+let currentJob = 0;
+
+async function handleFile(file) {
+  const job = ++currentJob;   // a newer drop/paste supersedes this one
+  stopScanner();
+  errorEl.classList.add('hidden');
+  dropzone.classList.add('busy');
+  let image = null;
+  try {
+    image = await loadImage(file);
+    await pause(30);          // let "Reading QR code…" paint before the heavy work
+    const started = performance.now();
+    let hit = null, other = null, tried = 0;
+    for (const [label, pixels] of imagePasses(image.img)) {
+      tried++;
+      const found = await readQR(pixels);
+      if (job !== currentJob) return;
+      const upn = found.find(isUPN);
+      if (upn) { hit = { text: upn, label }; break; }
+      other ??= found[0];
+      await pause();          // keep the page responsive between passes
+    }
+    console.log(`[UPN→SEPA] QR decode: ${image.img.naturalWidth}×${image.img.naturalHeight},`,
+      hit ? `read on pass ${tried} (${hit.label})`
+        : `${other != null ? 'only a non-UPN code' : 'nothing'} after ${tried} passes`,
+      `in ${Math.round(performance.now() - started)} ms`);
+    if (hit) {
+      processUPN(hit.text);
+    } else if (other != null) {
+      processUPN(other);      // some other QR — parseUPN explains what was in it
+    } else {
+      showError('No QR code found. Make sure the whole code is in the picture, in focus and evenly lit' +
+        (canScan ? ' — or use “Scan with camera”.' : '.'));
+    }
+  } catch (err) {
+    if (job === currentJob) showError(err.message);
+  } finally {
+    image?.release();
+    if (job === currentJob) dropzone.classList.remove('busy');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Live camera scanning
+// ---------------------------------------------------------------------------
+const cameraBtn = document.getElementById('cameraBtn');
+const scannerEl = document.getElementById('scanner');
+const videoEl = document.getElementById('video');
+const scanHint = document.getElementById('scanHint');
+const scanClose = document.getElementById('scanClose');
+
+const HINT_AIM = 'Point the camera at the UPN QR code';
+const HINT_NOT_UPN = 'That QR code is not a UPN payment code';
+
+// getUserMedia only exists on https:// and localhost.
+const canScan = hasReader && !!navigator.mediaDevices?.getUserMedia;
+if (canScan) cameraBtn.classList.remove('hidden');
+
+let stream = null;
+let scanSession = 0;
+
+cameraBtn.addEventListener('click', startScanner);
+scanClose.addEventListener('click', stopScanner);
+window.addEventListener('keydown', (e) => { if (e.key === 'Escape') stopScanner(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) stopScanner(); });
+
+async function startScanner() {
+  const session = ++scanSession;
+  currentJob++;               // abandon any photo still being read
+  dropzone.classList.remove('busy');
+  errorEl.classList.add('hidden');
+  let media;
+  try {
+    media = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      // The code is dense, so ask for more than the 640×480 default.
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    });
+  } catch (err) {
+    if (session === scanSession) showError(cameraError(err));
+    return;
+  }
+  if (session !== scanSession) {            // closed or superseded while the prompt was open
+    media.getTracks().forEach(t => t.stop());
+    return;
+  }
+  stream = media;
+
+  // Phones that expose focus control: keep refocusing as the bill moves.
+  const [track] = stream.getVideoTracks();
+  if (track.getCapabilities?.().focusMode?.includes('continuous')) {
+    track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
+  }
+
+  scanHint.textContent = HINT_AIM;
+  cameraBtn.classList.add('hidden');
+  scannerEl.classList.remove('hidden');
+  videoEl.srcObject = stream;
+  try {
+    await videoEl.play();
+  } catch {}                  // interrupted by stopScanner(); the loop below exits
+  scanLoop(session);
+}
+
+function stopScanner() {
+  scanSession++;
+  if (!stream) return;
+  stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  videoEl.srcObject = null;
+  scannerEl.classList.add('hidden');
+  if (canScan) cameraBtn.classList.remove('hidden');
+}
+
+async function scanLoop(session) {
+  let frame = 0, otherSeenAt = -Infinity;
+  while (session === scanSession) {
+    const w = videoEl.videoWidth, h = videoEl.videoHeight;
+    if (videoEl.readyState >= 2 && w && h) {
+      // Alternate the whole frame with its centre enlarged ×2 and sharpened,
+      // which picks up a code held too far from the lens for the plain read.
+      const pixels = frame++ % 2
+        ? sharpen(grab(videoEl, w / 4, h / 4, w / 2, h / 2, w, h))
+        : grab(videoEl, 0, 0, w, h, w, h);
+      let found;
+      try {
+        found = await readQR(pixels);
+      } catch (err) {
+        if (session === scanSession) { stopScanner(); showError(err.message); }
+        return;
+      }
+      if (session !== scanSession) return;
+      const upn = found.find(isUPN);
+      if (upn) {
+        console.log(`[UPN→SEPA] QR decode: camera frame ${w}×${h}, read after ${frame} frames`);
+        stopScanner();
+        processUPN(upn);
+        return;
+      }
+      if (found.length) otherSeenAt = performance.now();
+      scanHint.textContent = performance.now() - otherSeenAt < 1500 ? HINT_NOT_UPN : HINT_AIM;
+    }
+    await pause(60);
+  }
+}
+
+function cameraError(err) {
+  switch (err?.name) {
+    case 'NotAllowedError':
+    case 'SecurityError':
+      return 'Camera access was blocked. Allow it for this page in your browser settings, or upload a photo instead.';
+    case 'NotFoundError':
+    case 'OverconstrainedError':
+      return 'No camera found on this device. Upload a photo instead.';
+    case 'NotReadableError':
+    case 'AbortError':
+      return 'The camera is in use by another app. Close it and try again.';
+    default:
+      return `Could not start the camera (${err?.message || err}).`;
+  }
 }
 
 function processUPN(text) {
@@ -352,10 +684,15 @@ function buildEPC(upn) {
   if (!upn.recipientIban) throw new Error('UPN QR missing recipient IBAN.');
   if (!upn.recipientName) throw new Error('UPN QR missing recipient name.');
 
-  const remittanceParts = [];
-  if (upn.recipientRef) remittanceParts.push(upn.recipientRef);
-  if (upn.purpose) remittanceParts.push(upn.purpose);
-  const remittance = remittanceParts.join(' ').substring(0, 140);
+  // The reference travels alone in its field, because it is the one thing the
+  // creditor reconciles on. The purpose text is only sent when the bill has no
+  // reference ("NRC" / model SI99 mean exactly that).
+  const ref = upn.recipientRef.replace(/\s+/g, '').toUpperCase();
+  const hasRef = ref !== '' && ref !== 'NRC' && ref !== 'SI99';
+  // Only ISO 11649 "RF" references are valid in the structured field;
+  // Slovenian SI-model references go in the unstructured one.
+  const structured = /^RF\d{2}[A-Z0-9]{1,21}$/.test(ref) ? ref : '';
+  const unstructured = structured ? '' : hasRef ? upn.recipientRef : upn.purpose;
 
   const fields = [
     'BCD',                                       // Service tag
@@ -367,10 +704,13 @@ function buildEPC(upn) {
     upn.recipientIban,                           // Beneficiary IBAN
     `EUR${upn.amount}`,                          // Amount
     upn.purposeCode.substring(0, 4),             // Purpose (optional)
-    '',                                          // Structured remittance (RF only)
-    remittance,                                  // Unstructured remittance
+    structured,                                  // Structured remittance (RF only)
+    unstructured.substring(0, 140),              // Unstructured remittance
     '',                                          // Beneficiary-to-originator info
   ];
+  // Trailing empty elements are left out rather than sent as blank lines;
+  // strict readers trip over a payload that ends in a separator.
+  while (fields.length > 8 && fields[fields.length - 1] === '') fields.pop();
   return fields.join('\n');
 }
 
